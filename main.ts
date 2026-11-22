@@ -4,7 +4,10 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import {
+  accessSync, chmodSync, constants, lstatSync, mkdirSync, readdirSync, readFileSync,
+  renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
@@ -25,6 +28,7 @@ class Fail {
 }
 
 const blank = (s: string): boolean => s.trim() === '';
+const trimSpaces = (s: string): string => s.replace(/^ +| +$/g, '');
 
 function patchLines(text: string): string[] {
   if (text === '') return [];
@@ -206,7 +210,7 @@ type UnifiedSection = {
 };
 
 function headerPath(line: string): string | null {
-  const path = line.slice(4).split('\t', 1)[0]!.trim();
+  const path = trimSpaces(line.slice(4).split('\t', 1)[0]!);
   return path === '/dev/null' ? null : path.replace(/^[ab]\//, '');
 }
 
@@ -307,8 +311,8 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       i = end - 1;
     } else if (section && section.hunks.length === 0) {
       if (line.startsWith('--- ')) parseError(i + 1);
-      if (line.startsWith('rename from ')) section.renameFrom = line.slice(12).trim();
-      else if (line.startsWith('rename to ')) section.renameTo = line.slice(10).trim();
+      if (line.startsWith('rename from ')) section.renameFrom = line.slice(12);
+      else if (line.startsWith('rename to ')) section.renameTo = line.slice(10);
       else if (/^new file mode(?: |$)/.test(line)) section.create = true;
       else if (/^deleted file mode(?: |$)/.test(line)) section.remove = true;
     }
@@ -369,7 +373,7 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
   const isBody = (line: string) => line === '' || /^[ +\-]/.test(line);
   while (i < end) {
     let anchor = '';
-    if (lines[i]!.startsWith('@@')) anchor = lines[i++]!.slice(2).trim();
+    if (lines[i]!.startsWith('@@')) anchor = trimSpaces(lines[i++]!.slice(2));
     else if (chunks.length > 0 || !isBody(lines[i]!)) parseError(i);
     const bodyStart = i;
     while (i < end && isBody(lines[i]!)) i++;
@@ -421,7 +425,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
     if (blank(lines[i]!)) { i++; continue; }
     const match = header.exec(lines[i]!);
     if (match === null) parseError(i);
-    const path = match[2]!.trim();
+    const path = trimSpaces(match[2]!);
     let next = i + 1;
     while (next < end && !header.test(lines[next]!)) next++;
     let bodyEnd = next;
@@ -490,22 +494,31 @@ function jsonEdit(v: unknown): Edit | null {
       tree.now.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
     };
   }
-  if (o.command === 'insert' && typeof o.insert_line === 'number' && Number.isInteger(o.insert_line) && typeof o.new_str === 'string') {
+  if (o.command === 'insert' && typeof o.insert_line === 'number' && typeof o.new_str === 'string') {
     const line = o.insert_line;
     const add = patchLines(o.new_str);
     return (tree) => {
       const before = exists(tree);
-      const nl = before.indexOf('\n');
-      const br = nl > 0 && before[nl - 1] === '\r' ? '\r\n' : '\n';
-      const lines = before === '' ? [] : before.split(br);
-      const final = before !== '' && before.endsWith(br);
-      if (final) lines.pop();
+      const file = readLines(before);
+      const { lines } = file;
       if (line < 0 || line > lines.length) throw new Fail('no-match', p);
-      lines.splice(line, 0, ...add);
-      tree.now.set(p, lines.length === 0 ? '' : lines.join(br) + (final ? br : ''));
+      file.lines = lines.slice(0, line).concat(add, lines.slice(line));
+      tree.now.set(p, writeLines(file));
     };
   }
   return null;
+}
+
+const nonIntegerToken = Symbol('non-integer JSON number');
+
+function parseJsonEdits(text: string): unknown {
+  return JSON.parse(text, (key: string, value: unknown, context?: { source: string }) => {
+    // Node 22 exposes the token even when its numeric value has already rounded.
+    if (key === 'insert_line' && typeof value === 'number' && !/^-?(?:0|[1-9][0-9]*)$/.test(context!.source)) {
+      return nonIntegerToken;
+    }
+    return value;
+  });
 }
 
 function jsonEdits(text: string, lines: string[]): Edit[] {
@@ -515,7 +528,7 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   if (lines[first]!.trimStart().startsWith('[')) {
     let v: unknown;
     try {
-      v = JSON.parse(text);
+      v = parseJsonEdits(text);
     } catch {
       throw new Exit2(`error: parse ${first + 1}`);
     }
@@ -531,7 +544,7 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
     if (blank(l)) return;
     let e: Edit | null = null;
     try {
-      e = jsonEdit(JSON.parse(l));
+      e = jsonEdit(parseJsonEdits(l));
     } catch {
       e = null;
     }
@@ -539,6 +552,127 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
     edits.push(e);
   });
   return edits;
+}
+
+type Write = { path: string; text: string; mode?: number };
+type CommitPlan = {
+  backups: { path: string; directory: boolean }[];
+  directories: string[];
+  writes: Write[];
+};
+
+function diskEntry(path: string) {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOTDIR') return undefined;
+    throw e;
+  }
+}
+
+/** Plan from the final tree, so both --check and real runs detect path conflicts. */
+function planCommit(changes: Map<string, string | null>): CommitPlan {
+  const backups: CommitPlan['backups'] = [];
+  const make = new Set<string>();
+  const checked = new Set<string>();
+  const writes: Write[] = [];
+  const removable = (path: string) => changes.get(path) === null;
+
+  function clearDirectory(path: string): void {
+    for (const name of readdirSync(path).sort()) {
+      const child = `${path}/${name}`;
+      if (removable(child)) continue; // Already scheduled for backup.
+      if (!diskEntry(child)?.isDirectory()) throw new Error('directory contains a retained file');
+      clearDirectory(child);
+    }
+    backups.push({ path, directory: true });
+  }
+
+  function ensureDirectory(path: string): void {
+    if (path === '.' || checked.has(path)) return;
+    if (typeof changes.get(path) === 'string') throw new Error('file conflicts with a parent directory');
+    ensureDirectory(dirname(path));
+    const entry = diskEntry(path);
+    if (removable(path) || !entry) make.add(path);
+    else if (!entry.isDirectory() && !(entry.isSymbolicLink() && statSync(path).isDirectory())) {
+      throw new Error('parent path is not a directory');
+    }
+    checked.add(path);
+  }
+
+  for (const [path, text] of changes) {
+    if (text === null) backups.push({ path, directory: false });
+  }
+  for (const [path, text] of changes) {
+    if (text === null) continue;
+    ensureDirectory(dirname(path));
+    const entry = diskEntry(path);
+    if (entry?.isDirectory()) clearDirectory(path);
+    else if (entry) {
+      if (entry.isFile()) accessSync(path, constants.W_OK);
+      backups.push({ path, directory: false });
+    }
+    writes.push({ path, text, mode: entry?.isFile() ? entry.mode & 0o7777 : undefined });
+  }
+
+  const parents = new Set(['.']);
+  for (const { path } of backups) parents.add(dirname(path));
+  for (const path of make) parents.add(dirname(path));
+  for (const { path } of writes) parents.add(dirname(path));
+  for (const path of parents) {
+    if (!make.has(path)) accessSync(path, constants.W_OK | constants.X_OK);
+  }
+  return { backups, directories: [...make], writes };
+}
+
+/** Keep the originals as directory entries so rollback restores bytes and metadata. */
+function applyCommit({ backups, directories, writes }: CommitPlan): void {
+  if (backups.length === 0 && writes.length === 0) return;
+  const reserved = new Set(writes.map(({ path }) => path.split('/', 1)[0]));
+  let scratch: string;
+  for (let i = 0; ; i++) {
+    scratch = `.mend-stage-${i}`;
+    if (reserved.has(scratch)) continue;
+    try {
+      mkdirSync(scratch, { mode: 0o700 });
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+  }
+
+  const undo: (() => void)[] = [];
+  try {
+    for (const [i, { text, mode }] of writes.entries()) {
+      const staged = `${scratch}/new-${i}`;
+      writeFileSync(staged, text, { flag: 'wx' });
+      if (mode !== undefined) chmodSync(staged, mode);
+    }
+    for (const [i, { path, directory }] of backups.entries()) {
+      // Never take a directory that still contains entries (e.g. a concurrent addition).
+      if (directory && readdirSync(path).length !== 0) throw new Error('directory is no longer empty');
+      const saved = `${scratch}/old-${i}`;
+      renameSync(path, saved);
+      undo.push(() => renameSync(saved, path));
+    }
+    for (const path of directories) {
+      mkdirSync(path);
+      undo.push(() => rmdirSync(path));
+    }
+    for (const [i, { path }] of writes.entries()) {
+      renameSync(`${scratch}/new-${i}`, path);
+      undo.push(() => unlinkSync(path));
+    }
+  } catch (e) {
+    const errors = [];
+    for (const rollback of undo.reverse()) {
+      try { rollback(); } catch (err) { errors.push(err); }
+    }
+    if (errors.length > 0) throw new AggregateError([e, ...errors], `rollback incomplete; backups at ${scratch}`);
+    rmSync(scratch, { recursive: true, force: true });
+    throw e;
+  }
+  rmSync(scratch, { recursive: true, force: true });
 }
 
 function run(args: string[]): { code: number; out: string[] } {
@@ -596,18 +730,23 @@ function run(args: string[]): { code: number; out: string[] } {
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
   const rows: string[] = [];
   const moves = tree.moveRows();
+  const changes = new Map<string, string | null>();
   for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     const was = tree.original(p);
     const now = tree.now.get(p)!;
     if (was === now) continue;
+    changes.set(p, now);
     const from = moves.destinations.get(p);
     if (from !== undefined) rows.push(`R ${from} -> ${p}`);
     else if (!moves.sources.has(p)) rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+  }
+  if (changes.size > 0) {
+    try {
+      const plan = planCommit(changes);
+      if (!check) applyCommit(plan);
+    } catch (e) {
+      if (e instanceof AggregateError) throw e;
+      return { code: 1, out: ['error: internal'] };
     }
   }
   return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
