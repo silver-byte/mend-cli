@@ -45,7 +45,7 @@ function safe(p: string): boolean {
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
-  readonly moves: { from: string; to: string; text: string }[] = [];
+  readonly events: ({ kind: 'move'; from: string; to: string } | { kind: 'reset'; path: string })[] = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -61,23 +61,33 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
+  set(p: string, text: string | null): void {
+    const existenceChanged = (this.get(p) === null) !== (text === null);
+    this.now.set(p, text);
+    if (existenceChanged) this.events.push({ kind: 'reset', path: p });
+  }
   move(from: string, to: string, text: string): void {
     this.now.set(from, null);
     this.now.set(to, text);
-    this.moves.push({ from, to, text });
+    this.events.push({ kind: 'move', from, to });
   }
   moveRows(): { sources: Set<string>; destinations: Map<string, string> } {
-    type Chain = { origin: string; dest: string; text: string };
+    type Chain = { origin: string; dest: string };
     const chains: Chain[] = [];
     const endingAt = new Map<string, Chain>();
-    for (const { from, to, text } of this.moves) {
+    for (const event of this.events) {
+      if (event.kind === 'reset') {
+        endingAt.delete(event.path);
+        continue;
+      }
+      const { from, to } = event;
       const chain = endingAt.get(from);
-      if (chain?.text === text) {
+      if (chain !== undefined) {
         endingAt.delete(from);
         chain.dest = to;
         endingAt.set(to, chain);
       } else {
-        const next = { origin: from, dest: to, text };
+        const next = { origin: from, dest: to };
         chains.push(next);
         endingAt.set(to, next);
       }
@@ -259,12 +269,12 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
       requireAbsent(tree, path);
       const additions = hunks.flatMap((h) => h.additions);
       const last = hunks.findLast((h) => h.additions.length > 0);
-      tree.now.set(path, newFile(additions, !last?.noCreationBreak));
+      tree.set(path, newFile(additions, !last?.noCreationBreak));
       return;
     }
     const original = requireFile(tree, old);
     if (next === null || section.remove) {
-      tree.now.set(old, null);
+      tree.set(old, null);
       return;
     }
     if (next !== old) requireAbsent(tree, next);
@@ -291,7 +301,7 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
     }
     const text = writeLines(file);
     if (next !== old) tree.move(old, next, text);
-    else tree.now.set(old, text);
+    else tree.set(old, text);
   };
 }
 
@@ -361,7 +371,7 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
       requireSafe(p);
       if (old.length === 0) {
         requireAbsent(tree, p);
-        tree.now.set(p, newFile(added));
+        tree.set(p, newFile(added));
         return;
       }
       const file = readLines(requireFile(tree, p));
@@ -369,7 +379,7 @@ function searchReplaceEdits(lines: string[], strict: boolean): Edit[] {
       if (match === null) throw new Fail('no-match', p);
       if (match.positions.length > 1) throw new Fail('ambiguous', p);
       replaceLines(file, change, match.positions[0]!, match.tier);
-      tree.now.set(p, writeLines(file));
+      tree.set(p, writeLines(file));
     });
     previousPath = path;
     outside = end + 1;
@@ -423,7 +433,7 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
     }
     const text = writeLines(file);
     if (destination !== null) tree.move(path, destination, text);
-    else tree.now.set(path, text);
+    else tree.set(path, text);
   };
 }
 
@@ -455,14 +465,14 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       edits.push((tree) => {
         requireSafe(path);
         requireAbsent(tree, path);
-        tree.now.set(path, newFile(added));
+        tree.set(path, newFile(added));
       });
     } else if (match[1] === 'Delete') {
       if (i + 1 < bodyEnd) parseError(i + 1);
       edits.push((tree) => {
         requireSafe(path);
         requireFile(tree, path);
-        tree.now.set(path, null);
+        tree.set(path, null);
       });
     } else edits.push(v4aUpdate(lines, i, bodyEnd, path, strict));
     i = next;
@@ -487,7 +497,7 @@ function jsonEdit(v: unknown): Edit | null {
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
       if (tree.get(p) !== null) throw new Fail('exists', p);
-      tree.now.set(p, text);
+      tree.set(p, text);
     };
   }
   if (o.command === 'str_replace' && typeof o.old_str === 'string' && o.old_str !== '' && (o.new_str === undefined || typeof o.new_str === 'string')) {
@@ -506,7 +516,7 @@ function jsonEdit(v: unknown): Edit | null {
       if (count > 1) throw new Fail('ambiguous', p);
       const at = t.indexOf(old);
       const out = t.slice(0, at) + lf(newStr) + t.slice(at + old.length);
-      tree.now.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
+      tree.set(p, crlf ? out.replaceAll('\n', '\r\n') : out);
     };
   }
   if (o.command === 'insert' && typeof o.insert_line === 'number' && typeof o.new_str === 'string') {
@@ -518,7 +528,7 @@ function jsonEdit(v: unknown): Edit | null {
       const { lines } = file;
       if (line < 0 || line > lines.length) throw new Fail('no-match', p);
       file.lines = lines.slice(0, line).concat(add, lines.slice(line));
-      tree.now.set(p, writeLines(file));
+      tree.set(p, writeLines(file));
     };
   }
   return null;
@@ -741,14 +751,14 @@ function run(args: string[]): { code: number; out: string[] } {
   const fails: Fail[] = [];
   for (const edit of edits) {
     const before = new Map(tree.now);
-    const moveCount = tree.moves.length;
+    const eventCount = tree.events.length;
     try {
       edit(tree);
     } catch (e) {
       if (!(e instanceof Fail)) throw e;
       tree.now.clear();
       for (const [k, v] of before) tree.now.set(k, v);
-      tree.moves.length = moveCount;
+      tree.events.length = eventCount;
       fails.push(e);
     }
   }
