@@ -45,7 +45,7 @@ function safe(p: string): boolean {
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
-  readonly moves: { from: string; to: string }[] = [];
+  readonly moves: { from: string; to: string; text: string }[] = [];
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let v: string | null = null;
@@ -64,17 +64,32 @@ class Tree {
   move(from: string, to: string, text: string): void {
     this.now.set(from, null);
     this.now.set(to, text);
-    this.moves.push({ from, to });
+    this.moves.push({ from, to, text });
   }
   moveRows(): { sources: Set<string>; destinations: Map<string, string> } {
+    type Chain = { origin: string; dest: string; text: string };
+    const chains: Chain[] = [];
+    const endingAt = new Map<string, Chain>();
+    for (const { from, to, text } of this.moves) {
+      const chain = endingAt.get(from);
+      if (chain?.text === text) {
+        endingAt.delete(from);
+        chain.dest = to;
+        endingAt.set(to, chain);
+      } else {
+        const next = { origin: from, dest: to, text };
+        chains.push(next);
+        endingAt.set(to, next);
+      }
+    }
     const sources = new Set<string>();
     const destinations = new Map<string, string>();
-    for (const { from, to } of this.moves) {
-      if (sources.has(from) || destinations.has(to)) continue;
-      if (this.original(from) === null || this.get(from) !== null) continue;
-      if (this.original(to) !== null || this.get(to) === null) continue;
-      sources.add(from);
-      destinations.set(to, from);
+    for (const { origin, dest } of chains) {
+      if (sources.has(origin) || destinations.has(dest)) continue;
+      if (this.original(origin) === null || this.get(origin) !== null) continue;
+      if (this.original(dest) !== null || this.get(dest) === null) continue;
+      sources.add(origin);
+      destinations.set(dest, origin);
     }
     return { sources, destinations };
   }
@@ -514,8 +529,18 @@ const nonIntegerToken = Symbol('non-integer JSON number');
 function parseJsonEdits(text: string): unknown {
   return JSON.parse(text, (key: string, value: unknown, context?: { source: string }) => {
     // Node 22 exposes the token even when its numeric value has already rounded.
-    if (key === 'insert_line' && typeof value === 'number' && !/^-?(?:0|[1-9][0-9]*)$/.test(context!.source)) {
-      return nonIntegerToken;
+    if (key === 'insert_line' && typeof value === 'number') {
+      if (!Number.isFinite(value)) return nonIntegerToken;
+      const [, whole, fraction = '', exponent = '0'] = /^-?(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(context!.source)!;
+      const digits = (whole + fraction).replace(/^0+/, '');
+      if (digits !== '') {
+        const shift = parseInt(exponent, 10) - fraction.length;
+        if (shift < 0) {
+          let end = digits.length;
+          while (digits[end - 1] === '0') end--;
+          if (digits.length - end < -shift) return nonIntegerToken;
+        }
+      }
     }
     return value;
   });
