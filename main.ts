@@ -61,25 +61,29 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
-  blocked(p: string): boolean {
+  blockers(p: string): string[] {
+    const paths: string[] = [];
     for (let parent = dirname(p); parent !== '.'; parent = dirname(parent)) {
-      if (this.get(parent) !== null) return true;
+      if (this.get(parent) !== null) paths.push(parent);
     }
     const prefix = `${p}/`;
     for (const [path, text] of this.now) {
-      if (text !== null && path.startsWith(prefix)) return true;
+      if (text !== null && path.startsWith(prefix)) paths.push(path);
     }
-    if (!diskEntry(p)?.isDirectory()) return false;
+    if (!diskEntry(p)?.isDirectory()) return paths;
     const pending = [p];
     while (pending.length > 0) {
       const directory = pending.pop()!;
       for (const entry of readdirSync(directory, { withFileTypes: true })) {
         const child = `${directory}/${entry.name}`;
         if (entry.isDirectory()) pending.push(child);
-        else if (this.get(child) !== null) return true;
+        else if (this.get(child) !== null) paths.push(child);
       }
     }
-    return false;
+    return paths;
+  }
+  blocked(p: string): boolean {
+    return this.blockers(p).length > 0;
   }
   set(p: string, text: string | null): void {
     const existenceChanged = (this.get(p) === null) !== (text === null);
@@ -150,6 +154,11 @@ function requireFile(tree: Tree, path: string): string {
 
 function requireAbsent(tree: Tree, path: string): void {
   if (tree.get(path) !== null || tree.blocked(path)) throw new Fail('exists', path);
+}
+
+function requireAbsentForMove(tree: Tree, dest: string, source: string): void {
+  // This edit removes its source, so only other live blockers make the destination exist.
+  if (tree.get(dest) !== null || tree.blockers(dest).some((path) => path !== source)) throw new Fail('exists', dest);
 }
 
 type LineFile = { lines: string[]; br: '\n' | '\r\n'; finalBreak: boolean };
@@ -302,7 +311,7 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
       tree.set(old, null);
       return;
     }
-    if (next !== old) requireAbsent(tree, next);
+    if (next !== old) requireAbsentForMove(tree, next, old);
     const file = readLines(original);
     let delta = 0;
     const clamp = (at: number) => Math.min(file.lines.length, Math.max(0, at));
@@ -436,7 +445,7 @@ function v4aUpdate(lines: string[], start: number, end: number, path: string, st
   return (tree) => {
     requireSafe(path, destination);
     const file = readLines(requireFile(tree, path));
-    if (destination !== null) requireAbsent(tree, destination);
+    if (destination !== null) requireAbsentForMove(tree, destination, path);
     let cursor = 0;
     for (const chunk of chunks) {
       if (chunk.anchor !== '') {
