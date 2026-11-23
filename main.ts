@@ -61,6 +61,26 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
+  blocked(p: string): boolean {
+    for (let parent = dirname(p); parent !== '.'; parent = dirname(parent)) {
+      if (this.get(parent) !== null) return true;
+    }
+    const prefix = `${p}/`;
+    for (const [path, text] of this.now) {
+      if (text !== null && path.startsWith(prefix)) return true;
+    }
+    if (!diskEntry(p)?.isDirectory()) return false;
+    const pending = [p];
+    while (pending.length > 0) {
+      const directory = pending.pop()!;
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const child = `${directory}/${entry.name}`;
+        if (entry.isDirectory()) pending.push(child);
+        else if (this.get(child) !== null) return true;
+      }
+    }
+    return false;
+  }
   set(p: string, text: string | null): void {
     const existenceChanged = (this.get(p) === null) !== (text === null);
     this.now.set(p, text);
@@ -72,11 +92,15 @@ class Tree {
     this.events.push({ kind: 'move', from, to });
   }
   moveRows(): { sources: Set<string>; destinations: Map<string, string> } {
-    type Chain = { origin: string; dest: string };
+    type Chain = { origin: string; dest: string; alive: boolean; preOrigin: boolean };
     const chains: Chain[] = [];
     const endingAt = new Map<string, Chain>();
+    const tainted = new Set<string>();
     for (const event of this.events) {
       if (event.kind === 'reset') {
+        tainted.add(event.path);
+        const chain = endingAt.get(event.path);
+        if (chain !== undefined) chain.alive = false;
         endingAt.delete(event.path);
         continue;
       }
@@ -87,14 +111,15 @@ class Tree {
         chain.dest = to;
         endingAt.set(to, chain);
       } else {
-        const next = { origin: from, dest: to };
+        const next = { origin: from, dest: to, alive: true, preOrigin: this.original(from) !== null && !tainted.has(from) };
         chains.push(next);
         endingAt.set(to, next);
       }
     }
     const sources = new Set<string>();
     const destinations = new Map<string, string>();
-    for (const { origin, dest } of chains) {
+    for (const { origin, dest, alive, preOrigin } of chains) {
+      if (!alive || !preOrigin) continue;
       if (sources.has(origin) || destinations.has(dest)) continue;
       if (this.original(origin) === null || this.get(origin) !== null) continue;
       if (this.original(dest) !== null || this.get(dest) === null) continue;
@@ -124,7 +149,7 @@ function requireFile(tree: Tree, path: string): string {
 }
 
 function requireAbsent(tree: Tree, path: string): void {
-  if (tree.get(path) !== null) throw new Fail('exists', path);
+  if (tree.get(path) !== null || tree.blocked(path)) throw new Fail('exists', path);
 }
 
 type LineFile = { lines: string[]; br: '\n' | '\r\n'; finalBreak: boolean };
@@ -496,7 +521,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      requireAbsent(tree, p);
       tree.set(p, text);
     };
   }
